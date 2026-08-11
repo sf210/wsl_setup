@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# sbx — run a command inside a bubblewrap sandbox scoped to this project.
+#
+# Usage:
+#   ./sbx                    interactive shell inside the sandbox
+#   ./sbx claude             Claude Code, confined to this project
+#   ./sbx make check
+#   ./sbx --no-net uv run pytest
+#
+# Visible inside the sandbox:
+#   * this project directory, read-write, at its real path
+#   * /usr /bin /lib /etc /opt ... read-only
+#   * a tmpfs $HOME containing only the uv / Claude Code toolchain
+#   * whatever .sandbox/binds.conf (and binds.local.conf) list
+#
+# Everything else on the filesystem is absent — not merely unreadable.
+
+set -euo pipefail
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+
+PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+command -v bwrap >/dev/null 2>&1 || die "bwrap not found — install the 'bubblewrap' package"
+
+NET=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-net) NET=0; shift ;;
+    --)       shift; break ;;
+    -*)       die "unknown sbx option: $1 (options must precede the command)" ;;
+    *)        break ;;
+  esac
+done
+
+A=(--die-with-parent --unshare-all)
+[ "$NET" -eq 1 ] && A+=(--share-net)
+
+A+=(--proc /proc --dev /dev --tmpfs /tmp)
+
+# System tree, read-only. Works whether these are real dirs or merged-usr symlinks.
+for d in /usr /bin /sbin /lib /lib32 /lib64 /etc /opt; do
+  [ -e "$d" ] && A+=(--ro-bind "$d" "$d")
+done
+
+# /etc/resolv.conf is often a symlink into /run; without its target, DNS fails.
+resolv="$(readlink -f /etc/resolv.conf 2>/dev/null || true)"
+if [ -n "$resolv" ] && [ "$resolv" != /etc/resolv.conf ] && [ -e "$resolv" ]; then
+  A+=(--ro-bind "$resolv" "$resolv")
+fi
+
+# Empty home, then only the toolchain back in. Caches are bound read-write so
+# they survive the sandbox; create them first or the binds have no source.
+# Failure is not fatal — a missing cache dir just means it lives in the tmpfs
+# and is discarded on exit.
+mkdir -p "$HOME/.cache/uv" "$HOME/.local/share/uv" "$HOME/.claude" 2>/dev/null || true
+A+=(--tmpfs "$HOME")
+for p in "$HOME/.local/bin" "$HOME/.local/share/claude" "$HOME/.gitconfig"; do
+  [ -e "$p" ] && A+=(--ro-bind "$p" "$p")
+done
+for p in "$HOME/.claude" "$HOME/.claude.json" "$HOME/.cache/uv" "$HOME/.local/share/uv"; do
+  [ -e "$p" ] && A+=(--bind "$p" "$p")
+done
+
+# The project itself, at its real path so the venv's absolute shebangs resolve.
+A+=(--bind "$PROJ" "$PROJ")
+
+# Extra paths from config. Format: "ro|rw  SOURCE  [DEST]", '#' comments.
+# DEST defaults to SOURCE; a relative DEST hangs off the project root.
+read_binds() {
+  local conf="$1" mode src dest
+  [ -f "$conf" ] || return 0
+  while read -r mode src dest; do
+    case "$mode" in ''|'#'*) continue ;; esac
+    [ -n "$src" ] || { warn "$conf: missing source path"; continue; }
+    src="${src/#\~/$HOME}"
+    dest="${dest:-$src}"
+    dest="${dest/#\~/$HOME}"
+    case "$dest" in /*) ;; *) dest="$PROJ/$dest" ;; esac
+    if [ ! -e "$src" ]; then
+      warn "$conf: skipping missing path: $src"
+      continue
+    fi
+    case "$mode" in
+      ro) A+=(--ro-bind "$src" "$dest") ;;
+      rw) A+=(--bind    "$src" "$dest") ;;
+      *)  warn "$conf: bad mode '$mode' (expected ro or rw)" ;;
+    esac
+  done < "$conf"
+}
+read_binds "$PROJ/.sandbox/binds.conf"
+read_binds "$PROJ/.sandbox/binds.local.conf"
+
+# Curated environment. Add more with SBX_PASSENV="VAR1 VAR2".
+#
+# No AI engine key is forwarded. Claude Code authenticates with this account's
+# own OAuth token in ~/.claude, so an API key would be a second, unnecessary
+# credential inside a sandbox built for low-trust tools. If you deliberately
+# want one in, ask for it: SBX_PASSENV=ANTHROPIC_API_KEY ./sbx ...
+A+=(--clearenv)
+for v in TERM COLORTERM LANG LC_ALL TZ ${SBX_PASSENV:-}; do
+  [ -n "${!v:-}" ] && A+=(--setenv "$v" "${!v}")
+done
+A+=(--setenv HOME "$HOME"
+    --setenv USER "$(id -un)"
+    --setenv SHELL /bin/bash
+    --setenv PATH "$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    --setenv PROJECT_ROOT "$PROJ"
+    --setenv SBX 1
+    --chdir "$PROJ")
+
+[ $# -gt 0 ] || set -- bash
+
+exec bwrap "${A[@]}" -- "$@"
