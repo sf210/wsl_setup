@@ -61,8 +61,8 @@ To expose a path from outside the project, add it to
 `.sandbox/binds.conf`:
 
 ```
-ro  /home/dad/data/prices.db
-ro  /home/dad/data/prices.db  external/prices.db
+ro  /home/sf/data/prices.db
+ro  /home/sf/data/prices.db  external/prices.db
 rw  ~/shared/scratch
 ```
 
